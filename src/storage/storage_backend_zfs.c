@@ -290,6 +290,126 @@ virStorageBackendZFSRefreshPool(virStoragePoolObjPtr pool ATTRIBUTE_UNUSED)
     return 0;
 }
 
+/*
+ * Create a storage vol using 'inputvol' as input
+ */
+int
+virStorageBackendZFSBuildFromLocal(virStoragePoolObjPtr pool,
+                                   virStorageVolDefPtr vol,
+                                   virStorageVolDefPtr inputvol,
+                                   unsigned int flags)
+{
+    virStoragePoolDefPtr def = virStoragePoolObjGetDef(pool);
+    int ret = -1;
+    int volmode_needed = -1;
+    VIR_AUTOPTR(virCommand) cmd = NULL;
+    VIR_AUTOPTR(virCommand) send_cmd = NULL;
+    VIR_AUTOPTR(virCommand) receive_cmd = NULL;
+    int transfer_fd = -1;
+    VIR_AUTOFREE(char *) buf = NULL;
+
+    VIR_FREE(vol->target.path);
+    if (virAsprintf(&vol->target.path, "%s/%s",
+                    def->target.path, vol->name) < 0)
+        return -1;
+
+    if (VIR_STRDUP(vol->key, vol->target.path) < 0)
+        goto cleanup1;
+
+    volmode_needed = virStorageBackendZFSVolModeNeeded();
+    if (volmode_needed < 0)
+        goto cleanup1;
+
+    /**
+     * $ zfs snapshot test/inputvolname@libvirt-cloning-snapshot
+     * 
+     * We first create a snapshot for cloning
+     */
+    cmd= virCommandNewArgList(ZFS, "snapshot", NULL);
+    virCommandAddArgFormat(cmd, "%s/%s@libvirt-cloning-snapshot", def->source.name, inputvol->name);
+
+    if (virCommandRun(cmd, NULL) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       "%s: %s", _("cannot create snapshot"), virCommandToString(cmd));
+        goto cleanup1;
+    }
+
+    /**
+     * $ zfs send test/inputvolname@libvirt-cloning-snapshot
+     * 
+     * Second, we create a send stream from the snapshot in a pipe via async Execution
+     */
+    send_cmd = virCommandNewArgList(ZFS, "send", NULL);
+    virCommandAddArgFormat(send_cmd, "%s/%s@libvirt-cloning-snapshot", def->source.name, inputvol->name);   
+    virCommandSetOutputFD(send_cmd, &transfer_fd);
+
+    if (virCommandRunAsync(send_cmd, NULL) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       "%s: %s", _("cannot start send"), virCommandToString(send_cmd));
+        goto cleanup2;
+    }
+
+    /**
+     * $ zfs receive test/volname
+     * 
+     * Third, we put the data from the previous created pipe in a new volume.
+     * For some reason this only works with the -F (force) parameter, otherwise, we get
+     * an error that the volume already exists.
+     */
+    receive_cmd = virCommandNewArgList(ZFS, "receive", NULL);
+    virCommandAddArg(receive_cmd, "-F");
+    virCommandAddArgFormat(receive_cmd, "%s/%s", def->source.name, vol->name);   
+    virCommandSetInputFD(receive_cmd, transfer_fd);
+    virCommandSetErrorBuffer(receive_cmd, &buf);
+    virCommandDoAsyncIO(receive_cmd);
+
+
+    if (virCommandRunAsync(receive_cmd, NULL) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       "%s: %s, %s", _("cannot start receive"), NULLSTR(buf), virCommandToString(receive_cmd));
+        goto cleanup2;
+    }
+
+    if (virCommandWait(receive_cmd, NULL) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       "%s: %s, %s", _("error while waiting on receive"), NULLSTR(buf), virCommandToString(receive_cmd));
+        goto cleanup2;
+    }
+
+    if (virCommandWait(send_cmd, NULL) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       "%s", _("error while waiting on send"));
+        goto cleanup2;
+    }
+
+    ret = 0;
+
+    /**
+     * $ zfs destroy test/inputvolname@libvirt-cloning-snapshot
+     * $ zfs destroy test/volname@libvirt-cloning-snapshot
+     * 
+     * Finally we have to cleanup by destroying the snapshots
+     */
+    cmd= virCommandNewArgList(ZFS, "destroy", NULL);
+    virCommandAddArgFormat(cmd, "%s/%s@libvirt-cloning-snapshot", def->source.name, vol->name);
+
+    if (virCommandRun(cmd, NULL) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       "%s: ", _("Cannot undo snapshot creation."));
+    }
+
+ cleanup2:
+    cmd= virCommandNewArgList(ZFS, "destroy", NULL);
+    virCommandAddArgFormat(cmd, "%s/%s@libvirt-cloning-snapshot", def->source.name, inputvol->name);
+
+    if (virCommandRun(cmd, NULL) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       "%s: ", _("Cannot undo snapshot creation."));
+    }
+ cleanup1:
+    return ret;
+}
+
 static int
 virStorageBackendZFSCreateVol(virStoragePoolObjPtr pool,
                               virStorageVolDefPtr vol)
@@ -423,6 +543,7 @@ virStorageBackend virStorageBackendZFS = {
 
     .checkPool = virStorageBackendZFSCheckPool,
     .refreshPool = virStorageBackendZFSRefreshPool,
+    .buildVolFrom = virStorageBackendZFSBuildFromLocal,
     .createVol = virStorageBackendZFSCreateVol,
     .deleteVol = virStorageBackendZFSDeleteVol,
     .buildPool = virStorageBackendZFSBuildPool,
